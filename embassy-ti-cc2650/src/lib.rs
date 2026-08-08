@@ -10,7 +10,9 @@ mod ccfg;
 pub mod chip;
 pub mod driverlib;
 pub mod gpio;
+pub mod gpt;
 pub mod prcm;
+pub mod rtc;
 pub mod uart;
 pub mod udma;
 
