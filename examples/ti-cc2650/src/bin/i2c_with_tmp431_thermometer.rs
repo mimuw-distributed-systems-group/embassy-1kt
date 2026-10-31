@@ -7,7 +7,7 @@ use embassy_ti_cc2650::{
     chip::peripherals,
     debug_print::{DebugPrint, debug_print},
     gpio::{Level, Output},
-    i2c::{self, new_master},
+    i2c::{self, MasterConfig, new_master},
 };
 use embassy_time::Timer;
 use panic_probe as _;
@@ -26,7 +26,8 @@ const TEMP_READ_ADDR: u8 = 0x00;
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
     let p = embassy_ti_cc2650::init();
-    let mut i2c_master = new_master(p.I2C, Irqs);
+    let config = MasterConfig::default();
+    let mut i2c_master = new_master(p.I2C, config, Irqs);
     let mut _l = Output::new(p.P_06, Level::High);
     let _debug_print = DebugPrint::new(p.P_28, p.P_29);
 
@@ -38,7 +39,9 @@ async fn main(_spawner: Spawner) {
     loop {
         Timer::after_millis(1000).await;
         // Start one-shot request; the data byte is required but its value is ignored.
-        let _ = i2c_master.write(TMP431A_ADDR, &[ONE_SHOT_REQUEST_WRITE_ADDR, 0x00]).await;
+        let _ = i2c_master
+            .write(TMP431A_ADDR, &[ONE_SHOT_REQUEST_WRITE_ADDR, 0x00])
+            .await;
         Timer::after_millis(100).await;
         // Set temperature high byte read address.
         let _ = i2c_master.write_byte(TMP431A_ADDR, TEMP_READ_ADDR).await;
