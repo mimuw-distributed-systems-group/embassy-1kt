@@ -1,5 +1,6 @@
 #![macro_use]
 
+use core::cell::Cell;
 use core::future::poll_fn;
 use core::marker::PhantomData;
 use core::task::Poll;
@@ -28,6 +29,24 @@ impl Default for MasterConfig {
             scl_pin: driverlib::IOID_19,
             fast_mode: false,
             loopback: false,
+        }
+    }
+}
+
+#[derive(Clone)]
+#[non_exhaustive]
+pub struct SlaveConfig {
+    pub sda_pin: u32,
+    pub scl_pin: u32,
+    pub addr: u8,
+}
+
+impl SlaveConfig {
+    pub fn new(addr: u8) -> Self {
+        Self {
+            sda_pin: driverlib::IOID_18,
+            scl_pin: driverlib::IOID_19,
+            addr,
         }
     }
 }
@@ -104,10 +123,13 @@ pub enum MasterResult {
     DataAck,
     /// Master lost arbitration.
     ArLost,
+    InvalidAddr,
 }
 
 pub struct I2CMaster<'a, T: Instance> {
     state: &'static State,
+    /// STOP owed to the bus by a cancelled transfer, sent once BUSY clears.
+    pending_stop: Cell<Option<u32>>,
     _p: PhantomData<(&'a (), T)>,
 }
 
@@ -136,6 +158,7 @@ impl<'a, T: Instance> I2CMaster<'a, T> {
 
         Self {
             state: T::state(),
+            pending_stop: Cell::new(None),
             _p: PhantomData,
         }
     }
@@ -157,26 +180,34 @@ impl<'a, T: Instance> I2CMaster<'a, T> {
         let error_flags = unsafe { driverlib::I2CMasterErr(driverlib::I2C0_BASE) };
         if error_flags == driverlib::I2C_MASTER_ERR_NONE {
             MasterResult::Ok
-        } else if error_flags & driverlib::I2C_MASTER_ERR_ADDR_ACK != 0 {
-            MasterResult::AddrAck
         } else if error_flags & driverlib::I2C_MASTER_ERR_ARB_LOST != 0 {
             MasterResult::ArLost
+        } else if error_flags & driverlib::I2C_MASTER_ERR_ADDR_ACK != 0 {
+            MasterResult::AddrAck
         } else {
             MasterResult::DataAck
         }
     }
 
-    fn get_drop_guard(flag: u32) -> OnDrop<impl FnOnce() -> ()> {
+    fn get_drop_guard(&self, flag: u32) -> OnDrop<impl FnOnce() + '_> {
         OnDrop::new(move || {
-            unsafe {
-                // MCTRL must not be written while a command is in flight.
-                while driverlib::I2CMasterBusy(driverlib::I2C0_BASE) {}
-                // After lost arbitration the bus isn't ours, so no STOP.
-                if driverlib::I2CMasterErr(driverlib::I2C0_BASE) & driverlib::I2C_MASTER_ERR_ARB_LOST == 0 {
-                    driverlib::I2CMasterControl(driverlib::I2C0_BASE, flag);
-                }
-            };
+            // Can't wait for BUSY in Drop, so defer the STOP to the next operation.
+            if unsafe { driverlib::I2CMasterBusy(driverlib::I2C0_BASE) } {
+                self.pending_stop.set(Some(flag));
+            } else {
+                Self::stop_unless_arb_lost(flag);
+            }
         })
+    }
+
+    /// Must only be called when the controller isn't BUSY.
+    fn stop_unless_arb_lost(flag: u32) {
+        unsafe {
+            // After lost arbitration the bus isn't ours, so no STOP.
+            if driverlib::I2CMasterErr(driverlib::I2C0_BASE) & driverlib::I2C_MASTER_ERR_ARB_LOST == 0 {
+                driverlib::I2CMasterControl(driverlib::I2C0_BASE, flag);
+            }
+        }
     }
 
     fn first_send_cmd(len: usize) -> u32 {
@@ -211,7 +242,28 @@ impl<'a, T: Instance> I2CMaster<'a, T> {
         }
     }
 
+    fn send_stale_stop_blocking(&self) {
+        if let Some(flag) = self.pending_stop.get() {
+            while unsafe { driverlib::I2CMasterBusy(driverlib::I2C0_BASE) } {}
+            self.pending_stop.set(None);
+            Self::stop_unless_arb_lost(flag);
+        }
+    }
+
+    async fn send_stale_stop(&self) {
+        if let Some(flag) = self.pending_stop.get() {
+            self.await_master_completion().await;
+            // Cleared only after the await, so cancelling here keeps the STOP pending.
+            self.pending_stop.set(None);
+            Self::stop_unless_arb_lost(flag);
+        }
+    }
+
     pub fn read_byte_blocking(&mut self, slave_addr: u8, buf: &mut u8) -> MasterResult {
+        if slave_addr > 0x7F {
+            return MasterResult::InvalidAddr;
+        }
+        self.send_stale_stop_blocking();
         unsafe {
             // Set the receiving slave address.
             driverlib::I2CMasterSlaveAddrSet(driverlib::I2C0_BASE, slave_addr, true);
@@ -231,6 +283,10 @@ impl<'a, T: Instance> I2CMaster<'a, T> {
     }
 
     pub fn write_byte_blocking(&mut self, slave_addr: u8, buf: u8) -> MasterResult {
+        if slave_addr > 0x7F {
+            return MasterResult::InvalidAddr;
+        }
+        self.send_stale_stop_blocking();
         unsafe {
             // Set the receiving slave address.
             driverlib::I2CMasterSlaveAddrSet(driverlib::I2C0_BASE, slave_addr, false);
@@ -247,6 +303,10 @@ impl<'a, T: Instance> I2CMaster<'a, T> {
     }
 
     pub async fn read_byte(&mut self, slave_addr: u8, buf: &mut u8) -> MasterResult {
+        if slave_addr > 0x7F {
+            return MasterResult::InvalidAddr;
+        }
+        self.send_stale_stop().await;
         unsafe {
             // Set the receiving slave address.
             driverlib::I2CMasterSlaveAddrSet(driverlib::I2C0_BASE, slave_addr, true);
@@ -266,6 +326,10 @@ impl<'a, T: Instance> I2CMaster<'a, T> {
     }
 
     pub async fn write_byte(&mut self, slave_addr: u8, buf: u8) -> MasterResult {
+        if slave_addr > 0x7F {
+            return MasterResult::InvalidAddr;
+        }
+        self.send_stale_stop().await;
         unsafe {
             // Set the receiving slave address.
             driverlib::I2CMasterSlaveAddrSet(driverlib::I2C0_BASE, slave_addr, false);
@@ -286,6 +350,10 @@ impl<'a, T: Instance> I2CMaster<'a, T> {
     /// Returns the number of bytes read, and in case of any errors,
     /// the error itself.
     pub async fn read(&mut self, slave_addr: u8, buf: &mut [u8]) -> (usize, MasterResult) {
+        if slave_addr > 0x7F {
+            return (0, MasterResult::InvalidAddr);
+        }
+        self.send_stale_stop().await;
         if buf.is_empty() {
             return (0, MasterResult::Ok);
         }
@@ -297,7 +365,7 @@ impl<'a, T: Instance> I2CMaster<'a, T> {
             self.await_master_completion().await;
             // Write 0-111 (single byte) or 0-1011 (burst start) to MCTRL.
             driverlib::I2CMasterControl(driverlib::I2C0_BASE, Self::first_recv_cmd(buf.len()));
-            let drop = Self::get_drop_guard(driverlib::I2C_MASTER_CMD_BURST_RECEIVE_ERROR_STOP);
+            let drop = self.get_drop_guard(driverlib::I2C_MASTER_CMD_BURST_RECEIVE_ERROR_STOP);
 
             for i in 1usize..buf.len() {
                 // Wait until master controller is not busy.
@@ -332,6 +400,10 @@ impl<'a, T: Instance> I2CMaster<'a, T> {
     }
 
     pub fn read_blocking(&mut self, slave_addr: u8, buf: &mut [u8]) -> (usize, MasterResult) {
+        if slave_addr > 0x7F {
+            return (0, MasterResult::InvalidAddr);
+        }
+        self.send_stale_stop_blocking();
         if buf.is_empty() {
             return (0, MasterResult::Ok);
         }
@@ -343,7 +415,7 @@ impl<'a, T: Instance> I2CMaster<'a, T> {
             while driverlib::I2CMasterBusy(driverlib::I2C0_BASE) {}
             // Write 0-111 (single byte) or 0-1011 (burst start) to MCTRL.
             driverlib::I2CMasterControl(driverlib::I2C0_BASE, Self::first_recv_cmd(buf.len()));
-            let drop = Self::get_drop_guard(driverlib::I2C_MASTER_CMD_BURST_RECEIVE_ERROR_STOP);
+            let drop = self.get_drop_guard(driverlib::I2C_MASTER_CMD_BURST_RECEIVE_ERROR_STOP);
 
             for i in 1usize..buf.len() {
                 // Wait until master controller is not busy.
@@ -382,6 +454,10 @@ impl<'a, T: Instance> I2CMaster<'a, T> {
     /// Returns the number of bytes sent, and in case of any errors,
     /// the error itself.
     pub async fn write(&mut self, slave_addr: u8, buf: &[u8]) -> (usize, MasterResult) {
+        if slave_addr > 0x7F {
+            return (0, MasterResult::InvalidAddr);
+        }
+        self.send_stale_stop().await;
         if buf.is_empty() {
             return (0, MasterResult::Ok);
         }
@@ -395,7 +471,7 @@ impl<'a, T: Instance> I2CMaster<'a, T> {
             driverlib::I2CMasterDataPut(driverlib::I2C0_BASE, buf[0]);
             // Write 0-111 (single byte) or 0-011 (burst start) to MCTRL.
             driverlib::I2CMasterControl(driverlib::I2C0_BASE, Self::first_send_cmd(buf.len()));
-            let drop = Self::get_drop_guard(driverlib::I2C_MASTER_CMD_BURST_SEND_ERROR_STOP);
+            let drop = self.get_drop_guard(driverlib::I2C_MASTER_CMD_BURST_SEND_ERROR_STOP);
 
             for i in 1usize..buf.len() {
                 // Wait until master controller is not busy.
@@ -429,6 +505,10 @@ impl<'a, T: Instance> I2CMaster<'a, T> {
 
     // Same as write, but blocking.
     pub fn write_blocking(&mut self, slave_addr: u8, buf: &[u8]) -> (usize, MasterResult) {
+        if slave_addr > 0x7F {
+            return (0, MasterResult::InvalidAddr);
+        }
+        self.send_stale_stop_blocking();
         if buf.is_empty() {
             return (0, MasterResult::Ok);
         }
@@ -442,7 +522,7 @@ impl<'a, T: Instance> I2CMaster<'a, T> {
             driverlib::I2CMasterDataPut(driverlib::I2C0_BASE, buf[0]);
             // Write 0-111 (single byte) or 0-011 (burst start) to MCTRL.
             driverlib::I2CMasterControl(driverlib::I2C0_BASE, Self::first_send_cmd(buf.len()));
-            let drop = Self::get_drop_guard(driverlib::I2C_MASTER_CMD_BURST_SEND_ERROR_STOP);
+            let drop = self.get_drop_guard(driverlib::I2C_MASTER_CMD_BURST_SEND_ERROR_STOP);
 
             for i in 1usize..buf.len() {
                 // Wait until master controller is not busy.
@@ -480,11 +560,9 @@ pub struct Runner<'d> {
 
 impl<'d> Runner<'d> {
     pub(crate) fn new(state: &'static State) -> Self {
-        Self { state: state }
+        Self { state }
     }
 
-    /// Not cancel-safe: dropping the future mid-transaction loses the bytes in flight.
-    /// The bus stays stretched until the next call resumes servicing it.
     pub async fn step(&mut self, read_callback: impl Fn(u8), write_callback: impl Fn() -> u8) {
         let _ = poll_fn(|cx| {
             self.state.slave_waker.register(cx.waker());
@@ -513,16 +591,16 @@ pub struct I2CSlave<'a, T: Instance> {
 
 impl<'a, T: Instance> I2CSlave<'a, T> {
     pub(crate) fn new(
-        //_i2c: Peri<'a, T>,
-        slave_addr: u8,
+        config: SlaveConfig,
         _irq: impl interrupt::typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'a,
     ) -> Self {
+        assert!(config.addr <= 0x7F, "I2C slave address must be 7-bit");
         unsafe {
             // Setup pins.
-            driverlib::IOCPinTypeI2c(driverlib::IOC_BASE, driverlib::IOID_18, driverlib::IOID_19);
+            driverlib::IOCPinTypeI2c(driverlib::IOC_BASE, config.sda_pin, config.scl_pin);
 
             // Initialize I2C slave.
-            driverlib::I2CSlaveInit(driverlib::I2C0_BASE, slave_addr);
+            driverlib::I2CSlaveInit(driverlib::I2C0_BASE, config.addr);
             driverlib::I2CSlaveIntEnable(
                 driverlib::I2C0_BASE,
                 driverlib::I2C_SLAVE_INT_STOP | driverlib::I2C_SLAVE_INT_START | driverlib::I2C_SLAVE_INT_DATA,
@@ -553,19 +631,23 @@ pub fn new_master<'a, T: Instance>(
 
 pub fn new_slave<'a, T: Instance>(
     _i2c: Peri<'a, T>,
-    slave_addr: u8,
+    slave_config: SlaveConfig,
     irq: impl interrupt::typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'a,
 ) -> I2CSlave<'a, T> {
-    I2CSlave::new(slave_addr, irq)
+    I2CSlave::new(slave_config, irq)
 }
 
 pub fn new_master_slave<'a, T: Instance>(
     _i2c: Peri<'a, T>,
     master_config: MasterConfig,
-    slave_addr: u8,
+    slave_config: SlaveConfig,
     irq: impl interrupt::typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'a,
 ) -> (I2CMaster<'a, T>, I2CSlave<'a, T>) {
-    (I2CMaster::new(master_config, irq), I2CSlave::new(slave_addr, irq))
+    assert!(
+        master_config.sda_pin == slave_config.sda_pin && master_config.scl_pin == slave_config.scl_pin,
+        "I2C master and slave must share SDA/SCL pins"
+    );
+    (I2CMaster::new(master_config, irq), I2CSlave::new(slave_config, irq))
 }
 
 pub(crate) use impl_i2c;

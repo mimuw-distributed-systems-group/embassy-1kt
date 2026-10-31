@@ -6,7 +6,7 @@ use embassy_ti_cc2650::{
     bind_interrupts,
     chip::peripherals,
     debug_print::{DebugPrint, debug_print},
-    i2c::{self, MasterConfig, Runner, new_master_slave},
+    i2c::{self, MasterConfig, Runner, SlaveConfig, new_master_slave},
 };
 use embassy_time::Timer;
 use panic_probe as _;
@@ -22,7 +22,7 @@ fn read_callback(data: u8) {
 #[embassy_executor::task]
 async fn slave_task(mut runner: Runner<'static>) -> ! {
     loop {
-        runner.step(read_callback, || return 0).await;
+        runner.step(read_callback, || 0).await;
     }
 }
 
@@ -33,7 +33,7 @@ async fn main(spawner: Spawner) {
     let p = embassy_ti_cc2650::init();
     let mut config = MasterConfig::default();
     config.loopback = true;
-    let (mut i2c_master, i2c_slave) = new_master_slave(p.I2C, config, SLAVE_ADDR, Irqs);
+    let (mut i2c_master, i2c_slave) = new_master_slave(p.I2C, config, SlaveConfig::new(SLAVE_ADDR), Irqs);
     let _debug_print = DebugPrint::new(p.P_28, p.P_29);
 
     let runner = i2c_slave.into_runner();

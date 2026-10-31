@@ -49,14 +49,12 @@ async fn main(_spawner: Spawner) {
         let mut tmp_byte = 0u8;
         let _ = i2c_master.read_byte(TMP431A_ADDR, &mut tmp_byte).await;
 
-        for i in 0..3 {
-            temp_buffer[i] = b'0';
-        }
+        temp_buffer.fill(b'0');
         let mut idx = 2;
         loop {
             let tmp = tmp_byte % 10;
             tmp_byte /= 10;
-            temp_buffer[idx] = tmp + '0' as u8;
+            temp_buffer[idx] = tmp + b'0';
             if tmp_byte == 0 {
                 break;
             }
